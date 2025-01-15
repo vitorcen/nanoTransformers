@@ -2,11 +2,13 @@ import logging
 import sys
 import os
 import torch
+import json
+import numpy as np
 from datasets import Dataset, DatasetDict
 from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
-    GPT2TokenizerFast,
+    AutoTokenizer,
     Trainer,
     TrainingArguments,
     default_data_collator,
@@ -26,44 +28,67 @@ def print_gpu_memory():
         logger.info(f"GPU Memory allocated: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
         logger.info(f"GPU Memory cached: {torch.cuda.memory_reserved() / 1024**2:.2f} MB")
 
-def create_sample_dataset():
-    # Create a more diverse dataset for testing
-    train_texts = [
-        # Technical content
-        "Machine learning is a subset of artificial intelligence that enables systems to learn and improve from experience.",
-        "Deep neural networks consist of multiple layers of interconnected nodes, processing information hierarchically.",
-        "Natural language processing combines linguistics and machine learning to understand human language.",
-        
-        # General knowledge
-        "The Earth orbits around the Sun in an elliptical path, completing one revolution in approximately 365.25 days.",
-        "Photosynthesis is the process by which plants convert sunlight into chemical energy to produce glucose.",
-        "The human brain contains approximately 86 billion neurons, forming complex neural networks.",
-        
-        # Creative writing
-        "The golden sunset painted the sky in brilliant hues of orange and purple, as birds flew homeward.",
-        "In the ancient forest, towering trees whispered secrets that had been kept for centuries.",
-        "The bustling city never sleeps, its lights twinkling like earthbound stars in the night.",
-        
-        # Historical facts
-        "The Industrial Revolution began in Britain in the late 18th century, transforming manufacturing processes.",
-        "Ancient Egyptians built the pyramids as tombs for their pharaohs, using sophisticated engineering techniques.",
-        "The Renaissance period marked a revival of art, science, and classical learning in Europe.",
-    ] * 50  # Repeat to create more samples
-    
-    eval_texts = [
-        "Quantum computing leverages the principles of quantum mechanics to process information.",
-        "Climate change affects global weather patterns and ecosystems in complex ways.",
-        "The development of writing systems revolutionized human civilization and knowledge transfer.",
-        "Space exploration has led to numerous technological advances benefiting everyday life.",
-    ] * 25  # Repeat to create more samples
-    
-    train_dataset = Dataset.from_dict({"text": train_texts})
-    eval_dataset = Dataset.from_dict({"text": eval_texts})
+def create_chinese_poetry_dataset():
+    # 获取数据集路径
+    dataset_dir = get_dataset_path()
+    if dataset_dir is None:
+        raise ValueError("Failed to download or locate the dataset")
+
+    # 初始化训练和验证数据
+    train_data = []
+    val_data = []
+
+    # 遍历目录中的所有 JSON 文件
+    logger.info("Processing JSON files:")
+    for filename in os.listdir(dataset_dir):
+        if filename.endswith('.json'):
+            file_path = os.path.join(dataset_dir, filename)
+            logger.info(f"Reading file: {filename}")
+            
+            entries_count = 0
+            with open(file_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    if line.strip():  # 跳过空行
+                        entry = json.loads(line)
+                        entries_count += 1
+                        
+                        # 在每条数据末尾添加 END 标记
+                        formatted_text = f"{entry['prompt']}\n{entry['response']}\nEND\n"
+                        
+                        # 随机分配到训练集或验证集
+                        if np.random.random() < 0.9:  # 90% 概率进入训练集
+                            train_data.append(formatted_text)
+                        else:
+                            val_data.append(formatted_text)
+            
+            logger.info(f"  - Processed {entries_count} entries from {filename}")
+
+    logger.info(f"\nTotal entries: Train = {len(train_data)}, Val = {len(val_data)}")
+
+    train_dataset = Dataset.from_dict({"text": train_data})
+    eval_dataset = Dataset.from_dict({"text": val_data})
     
     return DatasetDict({
         "train": train_dataset,
         "validation": eval_dataset
     })
+
+def get_dataset_path(dataset_name="Iess/chinese_modern_poetry"):
+    """获取数据集路径，如果本地不存在则下载"""
+    try:
+        from huggingface_hub import snapshot_download
+        # 尝试使用 snapshot_download 下载整个数据集
+        dataset_path = snapshot_download(
+            repo_id=dataset_name,
+            repo_type="dataset",
+            local_dir=None,  # 使用默认的缓存目录
+            ignore_patterns=[".*"],
+        )
+        logger.info(f"Dataset downloaded to: {dataset_path}")
+        return dataset_path
+    except Exception as e:
+        logger.error(f"Error downloading dataset: {e}")
+        return None
 
 def test_generation(model, tokenizer, prompt, max_length=50):
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
@@ -92,11 +117,9 @@ def main():
     
     # Create tokenizer
     logger.info("Creating tokenizer")
-    tokenizer = GPT2TokenizerFast.from_pretrained('gpt2', local_files_only=False)
-    tokenizer.pad_token = tokenizer.eos_token
-    
-    # Create model
-    logger.info("Creating model")
+    tokenizer = AutoTokenizer.from_pretrained("hfl/chinese-roberta-wwm-ext", trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.add_special_tokens({'pad_token': '[PAD]'})
     model = AutoModelForCausalLM.from_config(config)
     model.resize_token_embeddings(len(tokenizer))
     logger.info(f"Model parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
@@ -108,12 +131,13 @@ def main():
     model = model.to(device)
     print_gpu_memory()
     
-    # Create dataset
-    logger.info("Creating dataset")
-    raw_datasets = create_sample_dataset()
+    # Load dataset
+    logger.info("Loading dataset")
+    dataset = create_chinese_poetry_dataset()
     
     # Preprocessing function
     def preprocess_function(examples):
+        logger.info(f"Processing batch of {len(examples['text'])} examples")
         # Tokenize the texts
         tokenized = tokenizer(
             examples["text"],
@@ -123,6 +147,7 @@ def main():
             return_overflowing_tokens=False,  
             return_length=True,
         )
+        logger.info(f"Tokenization complete. Input length: {tokenized['length'][0]}")
         
         # Create labels for language modeling (input_ids shifted right)
         tokenized["labels"] = tokenized["input_ids"].copy()
@@ -131,50 +156,51 @@ def main():
     
     # Preprocess the dataset
     logger.info("Preprocessing dataset")
-    tokenized_datasets = raw_datasets.map(
+    tokenized_datasets = dataset.map(
         preprocess_function,
         batched=True,
-        remove_columns=raw_datasets["train"].column_names,
+        remove_columns=dataset["train"].column_names,
         num_proc=1,
     )
     print_gpu_memory()
     
     # Training arguments
     training_args = TrainingArguments(
-        output_dir="./train-output",  
-        overwrite_output_dir=True,
-        num_train_epochs=3,           
-        per_device_train_batch_size=1,
-        per_device_eval_batch_size=1,
-        save_steps=100,
-        save_total_limit=2,
+        output_dir="./results",
+        num_train_epochs=3,
+        per_device_train_batch_size=4,
+        per_device_eval_batch_size=4,
+        warmup_steps=500,
+        weight_decay=0.01,
+        logging_dir="./logs",
         logging_steps=10,
-        learning_rate=5e-5,
-        warmup_ratio=0.1,
         evaluation_strategy="steps",
-        eval_steps=50,
-        fp16=True,
-        gradient_accumulation_steps=8,
-        gradient_checkpointing=True,
-        optim="adamw_torch_fused",
-        max_grad_norm=1.0,
-        ddp_find_unused_parameters=False,
-        dataloader_pin_memory=False,
-        report_to="none",
+        eval_steps=500,
+        save_steps=1000,
+        gradient_accumulation_steps=4,
+        learning_rate=1e-4,
+        report_to=["tensorboard"],
     )
     
-    # Initialize Trainer
+    logger.info(f"Training arguments: {training_args}")
+    
+    # Create Trainer
     trainer = Trainer(
         model=model,
         args=training_args,
-        train_dataset=tokenized_datasets["train"],  # Use full dataset
+        train_dataset=tokenized_datasets["train"],
         eval_dataset=tokenized_datasets["validation"],
         tokenizer=tokenizer,
-        data_collator=default_data_collator,
     )
     
-    # Start training
     logger.info("Starting training")
+    logger.info(f"Number of training examples: {len(tokenized_datasets['train'])}")
+    logger.info(f"Number of validation examples: {len(tokenized_datasets['validation'])}")
+    logger.info(f"Number of epochs: {training_args.num_train_epochs}")
+    logger.info(f"Batch size: {training_args.per_device_train_batch_size}")
+    logger.info(f"Learning rate: {training_args.learning_rate}")
+    
+    # Start training
     print_gpu_memory()
     trainer.train()
     
